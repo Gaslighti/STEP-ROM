@@ -861,14 +861,11 @@ def resolve_case_prescribed_dofs(config: dict, model_info: dict) -> List[str]:
     family = str(model_info.get("family", "solid")).lower()
 
     if mode == "auto":
-        # STEP задаёт модальную форму как вектор перемещений.
-        # Корректная общая запись *BOUNDARY_PRESCRIBED_MOTION_NODE здесь
-        # поддерживает только поступательные DOF. Shell-вращения (ROTX/ROTY/ROTZ)
-        # нельзя кодировать тем же dof_map=4/5/6 при vid=0: для них нужна
-        # отдельная LS-DYNA ветка/keyword encoding и/или валидный DEFINE_VECTOR.
-        # Поэтому штатный auto-режим всегда остаётся в безопасном
-        # поступательном STEP-векторе; normal_only доступен только явно.
-        if family in ("solid", "shell", "mixed"):
+        if family == "shell" and model_info.get("rotations_present", False):
+            return ["UX", "UY", "UZ", "ROTX", "ROTY", "ROTZ"]
+        if family == "solid":
+            return ["UX", "UY", "UZ"]
+        if family == "mixed":
             return ["UX", "UY", "UZ"]
         return [normal_dof]
 
