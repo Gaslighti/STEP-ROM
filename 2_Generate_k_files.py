@@ -13,6 +13,8 @@ import numpy as np
 
 FIELD_WIDTH = 10
 VALID_DOFS = ("UX", "UY", "UZ", "ROTX", "ROTY", "ROTZ")
+TRANSLATIONAL_DOF_MAP = {"UX": 1, "UY": 2, "UZ": 3}
+ROTATIONAL_DOF_IDS = {4, 5, 6}
 FILENAME_MODE_RE = re.compile(r"mode[^0-9]*([0-9]+)", re.IGNORECASE)
 
 
@@ -78,6 +80,33 @@ def translational_dofs() -> List[str]:
 
 def rotational_dofs() -> List[str]:
     return ["ROTX", "ROTY", "ROTZ"]
+
+
+def encode_translational_prescribed_motion_dof(dof: str) -> int:
+    """Encode only supported translational DOF for *BOUNDARY_PRESCRIBED_MOTION_NODE."""
+    normalized = str(dof).upper()
+    if normalized not in TRANSLATIONAL_DOF_MAP:
+        raise ValueError(
+            "Вращательные DOF для *BOUNDARY_PRESCRIBED_MOTION_NODE пока не поддержаны "
+            f"без отдельного LS-DYNA keyword/DEFINE_VECTOR encoding: {dof}. "
+            "Используйте primary_step_prescribed_mode='translational' или prescribed_dofs=['UX','UY','UZ']."
+        )
+    return TRANSLATIONAL_DOF_MAP[normalized]
+
+
+def validate_prescribed_motion_node_records(motion_records, *, context: str, vid: int = 0) -> None:
+    """Fail before writing an invalid *BOUNDARY_PRESCRIBED_MOTION_NODE block."""
+    if vid != 0:
+        return
+    bad = [(nid, dof_id) for nid, dof_id, _sf_value in motion_records if int(dof_id) in ROTATIONAL_DOF_IDS]
+    if bad:
+        sample = ", ".join(f"nid={nid}, dof={dof_id}" for nid, dof_id in bad[:5])
+        raise ValueError(
+            f"{context}: invalid *BOUNDARY_PRESCRIBED_MOTION_NODE records with vid=0 "
+            f"and rotational/vector DOF ids 4/5/6 ({sample}). "
+            "ROTX/ROTY/ROTZ нельзя записывать через общий dof_map=4/5/6 без отдельного "
+            "корректного LS-DYNA keyword/DOF encoding и/или валидного *DEFINE_VECTOR с ненулевым vid."
+        )
 
 
 def normalize_config(config: dict) -> dict:
@@ -823,13 +852,14 @@ def resolve_case_prescribed_dofs(config: dict, model_info: dict) -> List[str]:
 
     if mode == "auto":
         # STEP задаёт модальную форму как вектор перемещений.
-        # Для solid корректный первичный STEP — полный поступательный
-        # вектор UX/UY/UZ. Режим normal_only оставлен только как явный
-        # специальный режим для отладки.
-        if family == "solid":
+        # Корректная общая запись *BOUNDARY_PRESCRIBED_MOTION_NODE здесь
+        # поддерживает только поступательные DOF. Shell-вращения (ROTX/ROTY/ROTZ)
+        # нельзя кодировать тем же dof_map=4/5/6 при vid=0: для них нужна
+        # отдельная LS-DYNA ветка/keyword encoding и/или валидный DEFINE_VECTOR.
+        # Поэтому штатный auto-режим всегда остаётся в безопасном
+        # поступательном STEP-векторе; normal_only доступен только явно.
+        if family in ("solid", "shell", "mixed"):
             return ["UX", "UY", "UZ"]
-        if family == "shell" and model_info.get("rotations_present", False):
-            return ["UX", "UY", "UZ", "ROTX", "ROTY", "ROTZ"]
         return [normal_dof]
 
     if mode == "normal_only":
@@ -1071,14 +1101,13 @@ def build_motion_records(
         for nid in active_nodes:
             for dof in prescribed_dofs:
                 target[nid][dof] += q_value * node_values[nid][dof]
-    dof_map = {"UX": 1, "UY": 2, "UZ": 3, "ROTX": 4, "ROTY": 5, "ROTZ": 6}
     records = []
     for nid in active_nodes:
         for dof in prescribed_dofs:
             value = target[nid][dof]
             if abs(value) <= zero_tol:
                 continue
-            records.append((nid, dof_map[dof], value))
+            records.append((nid, encode_translational_prescribed_motion_dof(dof), value))
     return records
 
 
@@ -1130,18 +1159,22 @@ def build_dual_motion_records(
     allowed_nodes = set(all_nodes) if prescribed_nodes is None else (set(prescribed_nodes) & set(all_nodes))
     active_nodes = [nid for nid in all_nodes if nid in allowed_nodes and nid not in excluded_nodes]
 
-    dof_map = {"UX": 1, "UY": 2, "UZ": 3, "ROTX": 4, "ROTY": 5, "ROTZ": 6}
     records: List[Tuple[int, int, float]] = []
 
     for nid in active_nodes:
         for dof in prescribed_dofs:
             value = q_value * shape.node_values[nid][dof]
             if abs(value) > zero_tol:
-                records.append((nid, dof_map[dof], float(value)))
+                records.append((nid, encode_translational_prescribed_motion_dof(dof), float(value)))
 
     return records
 
 def build_boundary_prescribed_motion_node_block(motion_records, curve_id):
+    validate_prescribed_motion_node_records(
+        motion_records,
+        context="Перед записью .k",
+        vid=0,
+    )
     lines = []
     for nid, dof_id, sf_value in motion_records:
         lines.append("*BOUNDARY_PRESCRIBED_MOTION_NODE")
