@@ -9,7 +9,7 @@ import re
 from dataclasses import dataclass
 from numbers import Real
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Set, Tuple, Union
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -43,6 +43,7 @@ class DualModeData:
 class ReactionSnapshot:
     time_value: float
     node_values: Dict[int, Dict[str, float]]
+    reaction_dofs: Tuple[str, ...]
 
 
 @dataclass
@@ -170,6 +171,101 @@ def rotational_dofs() -> List[str]:
 
 def all_dofs(use_rotations: bool) -> List[str]:
     return translational_dofs() + (rotational_dofs() if use_rotations else [])
+
+
+def generalized_force_dofs_for_projection(use_rotations: bool) -> List[str]:
+    return all_dofs(use_rotations)
+
+
+def _parse_optional_bool_or_auto(value: object, name: str) -> Union[bool, str]:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return "auto"
+    text = str(value).strip().lower()
+    if text in {"auto", ""}:
+        return "auto"
+    if text in {"1", "true", "yes", "y", "on"}:
+        return True
+    if text in {"0", "false", "no", "n", "off"}:
+        return False
+    raise ValueError(f"{name} должен быть bool или 'auto', получено: {value!r}")
+
+
+def _manifest_prescribed_dofs(manifest: object) -> List[str]:
+    if not isinstance(manifest, dict):
+        return []
+    raw = manifest.get("prescribed_dofs")
+    if raw is None and isinstance(manifest.get("setup_validation"), dict):
+        raw = manifest["setup_validation"].get("prescribed_dofs")
+    if isinstance(raw, str):
+        raw_items = [raw]
+    elif isinstance(raw, Sequence):
+        raw_items = list(raw)
+    else:
+        return []
+    known = set(translational_dofs() + rotational_dofs())
+    out: List[str] = []
+    for item in raw_items:
+        dof = str(item).strip().upper()
+        if dof in known and dof not in out:
+            out.append(dof)
+    return out
+
+
+def resolve_generalized_force_projection(local_cfg: dict) -> List[str]:
+    requested = _parse_optional_bool_or_auto(
+        local_cfg.get("use_rotations_in_generalized_force", "auto"),
+        "use_rotations_in_generalized_force",
+    )
+    prescribed = _manifest_prescribed_dofs(local_cfg.get("_step_manifest"))
+    has_rotational_prescribed = any(dof in rotational_dofs() for dof in prescribed)
+    has_only_translational_prescribed = bool(prescribed) and all(dof in translational_dofs() for dof in prescribed)
+
+    if requested == "auto":
+        if has_only_translational_prescribed:
+            use_rotations = False
+            source = "step_manifest_prescribed_dofs"
+        elif prescribed and has_rotational_prescribed:
+            use_rotations = True
+            source = "step_manifest_prescribed_dofs"
+        else:
+            use_rotations = False
+            source = "default_translational_no_manifest_rotations"
+    else:
+        use_rotations = bool(requested)
+        source = "config_explicit"
+        if requested is True and has_only_translational_prescribed:
+            local_cfg["_generalized_force_warning"] = (
+                "use_rotations_in_generalized_force=True explicitly overrides STEP manifest "
+                f"prescribed_dofs={prescribed}, which has no ROTX/ROTY/ROTZ. Reaction "
+                "snapshots will be checked for xmoment/ymoment/zmoment before projection."
+            )
+
+    resolved = generalized_force_dofs_for_projection(use_rotations)
+    local_cfg["use_rotations_in_generalized_force"] = use_rotations
+    local_cfg["_generalized_force_dofs_resolved"] = resolved
+    local_cfg["_generalized_force_resolution"] = {
+        "requested_use_rotations": requested,
+        "source": source,
+        "step_manifest_prescribed_dofs": prescribed,
+        "has_rotational_prescribed_dofs": has_rotational_prescribed,
+    }
+    return resolved
+
+
+def ensure_reaction_snapshot_supports_projection(snapshot: ReactionSnapshot, use_rotations: bool, context: str) -> None:
+    if not use_rotations:
+        return
+    missing = [dof for dof in ("MX", "MY", "MZ") if dof not in snapshot.reaction_dofs]
+    if missing:
+        raise ValueError(
+            f"{context}: requested use_rotations_in_generalized_force=True, but reaction snapshot "
+            f"contains reaction_dofs={list(snapshot.reaction_dofs)} and is missing rotational "
+            f"reactions {missing}. Use translational generalized-force projection "
+            "(use_rotations_in_generalized_force='auto' or False) or provide a full reaction "
+            "output containing xmoment/ymoment/zmoment."
+        )
 
 
 def estimate_modal_normal_dof(
@@ -637,13 +733,24 @@ def parse_bndout_all_snapshots(path: Path) -> List[ReactionSnapshot]:
     snapshots: List[ReactionSnapshot] = []
     current_time: Optional[float] = None
     current_nodes: Dict[int, Dict[str, float]] = {}
+    current_reaction_dofs: Set[str] = set()
 
     def flush_snapshot():
-        nonlocal current_time, current_nodes
+        nonlocal current_time, current_nodes, current_reaction_dofs
         if current_time is not None and current_nodes:
-            snapshots.append(ReactionSnapshot(time_value=current_time, node_values=current_nodes))
+            ordered_dofs = tuple(
+                dof
+                for dof in ("FX", "FY", "FZ", "MX", "MY", "MZ")
+                if dof in current_reaction_dofs
+            )
+            snapshots.append(ReactionSnapshot(
+                time_value=current_time,
+                node_values=current_nodes,
+                reaction_dofs=ordered_dofs,
+            ))
         current_time = None
         current_nodes = {}
+        current_reaction_dofs = set()
 
     def try_extract_time(line: str) -> Optional[float]:
         compact = re.sub(r"\s+", "", line).lower()
@@ -682,6 +789,7 @@ def parse_bndout_all_snapshots(path: Path) -> List[ReactionSnapshot]:
             flush_snapshot()
             current_time = tval
             current_nodes = {}
+            current_reaction_dofs = set()
             continue
 
         if current_time is None:
@@ -698,6 +806,7 @@ def parse_bndout_all_snapshots(path: Path) -> List[ReactionSnapshot]:
                 "MY": float(nm.group(8)),
                 "MZ": float(nm.group(9)),
             }
+            current_reaction_dofs.update(("FX", "FY", "FZ", "MX", "MY", "MZ"))
             continue
 
         nm = node_re_basic.search(line)
@@ -711,6 +820,7 @@ def parse_bndout_all_snapshots(path: Path) -> List[ReactionSnapshot]:
                 "MY": 0.0,
                 "MZ": 0.0,
             }
+            current_reaction_dofs.update(("FX", "FY", "FZ"))
             continue
 
     flush_snapshot()
@@ -752,6 +862,7 @@ def build_phi_vector_from_field(field: Dict[int, Dict[str, float]], node_order: 
 
 
 def build_reaction_vector(snapshot: ReactionSnapshot, node_order: Sequence[int], reaction_sign: float, use_rotations: bool) -> np.ndarray:
+    ensure_reaction_snapshot_supports_projection(snapshot, use_rotations, "build_reaction_vector")
     values: List[float] = []
     for node in node_order:
         nd = snapshot.node_values[node]
@@ -2280,6 +2391,7 @@ def process_bc(case_dir: Path, cfg: dict) -> Dict[str, str]:
         resolved_model_family = local_cfg["_step_model_info"].get("family")
     resolved_normal_dof, normal_meta = resolve_normal_dof(local_cfg, modes, selected_modes)
     local_cfg["normal_dof"] = resolved_normal_dof
+    generalized_force_dofs_resolved = resolve_generalized_force_projection(local_cfg)
 
     dual_modes = build_dual_modes(case_dir, modes, selected_modes, local_cfg)
 
@@ -2287,8 +2399,8 @@ def process_bc(case_dir: Path, cfg: dict) -> Dict[str, str]:
         reactions_dir=reactions_dir,
         modes=modes,
         selected_modes=selected_modes,
-        reaction_sign=float(cfg["reaction_sign"]),
-        use_rotations=bool(cfg["use_rotations_in_generalized_force"]),
+        reaction_sign=float(local_cfg["reaction_sign"]),
+        use_rotations=bool(local_cfg["use_rotations_in_generalized_force"]),
     )
     experiments = list(experiments_map.values())
 
@@ -2395,6 +2507,9 @@ def process_bc(case_dir: Path, cfg: dict) -> Dict[str, str]:
             "normal_dof_meta": normal_meta,
             "d3plot_reference_meta": local_cfg.get("_d3plot_reference_meta", {}),
             "force_path_diagnostics": local_cfg.get("_force_path_diagnostics", []),
+            "generalized_force_dofs_resolved": generalized_force_dofs_resolved,
+            "generalized_force_resolution": local_cfg.get("_generalized_force_resolution", {}),
+            "generalized_force_warning": local_cfg.get("_generalized_force_warning"),
             "q_filter_info": q_filter_info,
             "K": K.tolist(),
             "G": G.tolist(),
@@ -2411,7 +2526,8 @@ def process_bc(case_dir: Path, cfg: dict) -> Dict[str, str]:
     lines.append(f"SELECTED MODES                          = {selected_modes}")
     lines.append(f"REACTIONS DIR                           = {reactions_dir}")
     lines.append(f"MODAL DIR                               = {modal_dir}")
-    lines.append(f"use_rotations_in_generalized_force      = {bool(cfg['use_rotations_in_generalized_force'])}")
+    lines.append(f"use_rotations_in_generalized_force      = {bool(local_cfg['use_rotations_in_generalized_force'])}")
+    lines.append(f"generalized_force_dofs_resolved        = {generalized_force_dofs_resolved}")
     lines.append(f"use_dual_modes                          = {bool(cfg['use_dual_modes'])}")
     lines.append(f"d3plot_backend                          = {cfg['d3plot_backend']}")
     lines.append(f"step_manifest_path                      = {local_cfg.get('_step_manifest_path')}")
@@ -2422,6 +2538,8 @@ def process_bc(case_dir: Path, cfg: dict) -> Dict[str, str]:
         lines.append(f"WARNING step_manifest                   = {local_cfg['_step_manifest_warning']}")
     if local_cfg.get("_rom_thickness_warning"):
         lines.append(f"WARNING thickness                       = {local_cfg['_rom_thickness_warning']}")
+    if local_cfg.get("_generalized_force_warning"):
+        lines.append(f"WARNING generalized_force               = {local_cfg['_generalized_force_warning']}")
     lines.append(f"min_step_q_for_coefficients             = {local_cfg.get('min_step_q_for_coefficients', 0.0)}")
     lines.append(f"relative_step_q_for_coefficients        = {local_cfg.get('relative_step_q_for_coefficients', 0.0)}")
     ref_meta = local_cfg.get("_d3plot_reference_meta", {})
@@ -2517,6 +2635,7 @@ def process_bc(case_dir: Path, cfg: dict) -> Dict[str, str]:
         "summary_csv": str(summary_csv),
         "coeff_json": str(coeff_json),
         "report_txt": str(report_txt),
+        "generalized_force_dofs_resolved": generalized_force_dofs_resolved,
     }
     if fe_states:
         result["curve_csv"] = str(curve_csv)
