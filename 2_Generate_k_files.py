@@ -2692,12 +2692,12 @@ def generate_step_cases_for_bc(case_dir: Path, config: dict) -> List[Path]:
 # Запуск real_load FE внутри 2-го скрипта для калибровки q
 # ---------------------------------------------------------------------
 
-def run_generate_k_files_stage(config: dict, root_dir: Path | None = None) -> None:
+def run_generate_k_files_stage(config: dict, base_dir: Path | None = None) -> None:
     config = normalize_config(config)
-    root_dir = Path(root_dir) if root_dir is not None else script_dir()
+    base_dir = Path(base_dir) if base_dir is not None else script_dir()
     exports_root = Path(config["exports_root"])
     if not exports_root.is_absolute():
-        exports_root = (root_dir / exports_root).resolve()
+        exports_root = (base_dir / exports_root).resolve()
     if not exports_root.exists():
         raise FileNotFoundError(f"Не найдена папка exports_root: {exports_root}")
     case_dirs = sorted([p for p in exports_root.glob(config["case_glob"]) if p.is_dir()])
