@@ -56,10 +56,11 @@ class StepRomPipeline:
         ),
     )
 
-    def __init__(self, repo_root: Path, logger: logging.Logger) -> None:
-        self.repo_root = repo_root
+    def __init__(self, code_root: Path, work_dir: Path, logger: logging.Logger) -> None:
+        self.code_root = Path(code_root).resolve()
+        self.work_dir = Path(work_dir).resolve()
         self.logger = logger
-        self.loader = StageModuleLoader(repo_root)
+        self.loader = StageModuleLoader(self.code_root)
 
     def run(self, pipeline_input: PipelineInput) -> None:
         self.logger.info("STEP-ROM pipeline started")
@@ -84,7 +85,7 @@ class StepRomPipeline:
         stderr_writer = LoggerWriter(self.logger, logging.ERROR)
         try:
             with contextlib.redirect_stdout(stdout_writer), contextlib.redirect_stderr(stderr_writer):
-                result = stage_func(config, base_dir=self.repo_root)
+                result = stage_func(config, base_dir=self.work_dir)
             stdout_writer.flush()
             stderr_writer.flush()
         except Exception:
