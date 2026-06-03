@@ -7,6 +7,7 @@ import logging
 import math
 import re
 from dataclasses import dataclass
+from numbers import Real
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -72,6 +73,42 @@ def script_dir() -> Path:
         return Path(__file__).resolve().parent
     except NameError:
         return Path.cwd()
+
+
+def _coerce_positive_finite_float(value: object, label: str) -> float:
+    try:
+        out = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{label} должен быть конечным числом > 0: {value!r}") from exc
+    if not math.isfinite(out) or out <= 0.0:
+        raise ValueError(f"{label} должен быть конечным числом > 0: {value!r}")
+    return out
+
+
+def _rom_thickness_fallback(cfg: dict) -> float:
+    return _coerce_positive_finite_float(cfg.get("thickness_fallback", 1.0), "thickness_fallback")
+
+
+def resolve_rom_thickness(case_dir: Path, cfg: dict) -> float:
+    raw = cfg.get("thickness", "auto")
+    if isinstance(raw, Real) and not isinstance(raw, bool):
+        return _coerce_positive_finite_float(raw, "thickness")
+
+    if raw is None or str(raw).strip().lower() == "auto":
+        fallback = _rom_thickness_fallback(cfg)
+        manifest_path = (
+            case_dir
+            / str(cfg.get("step_dir_name", "step"))
+            / str(cfg.get("step_manifest_filename", "step_manifest.json"))
+        )
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            estimate = manifest.get("model_info", {}).get("thickness_estimate")
+            return _coerce_positive_finite_float(estimate, "model_info.thickness_estimate")
+        except (OSError, json.JSONDecodeError, ValueError, TypeError, AttributeError):
+            return fallback
+
+    return _coerce_positive_finite_float(raw, "thickness")
 
 
 def fmt(x: float) -> str:
@@ -2026,6 +2063,7 @@ def process_bc(case_dir: Path, cfg: dict) -> Dict[str, str]:
     modes = discover_modes(modal_dir, selected_modes)
 
     local_cfg = dict(cfg)
+    local_cfg["thickness"] = resolve_rom_thickness(case_dir, local_cfg)
     resolved_normal_dof, normal_meta = resolve_normal_dof(local_cfg, modes, selected_modes)
     local_cfg["normal_dof"] = resolved_normal_dof
 
