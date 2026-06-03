@@ -19,6 +19,21 @@ ROTATIONAL_DOF_IDS = set(ROTATIONAL_DOF_MAP.values())
 FILENAME_MODE_RE = re.compile(r"mode[^0-9]*([0-9]+)", re.IGNORECASE)
 
 
+UNSUPPORTED_ROTATIONAL_PRESCRIBED_MOTION_NODE_MESSAGE = (
+    "ROTX/ROTY/ROTZ are not supported for *BOUNDARY_PRESCRIBED_MOTION_NODE "
+    "in this generator; use translational STEP or another load scheme"
+)
+
+
+def rotational_prescribed_dofs(dofs) -> List[str]:
+    return [dof for dof in (str(x).upper() for x in dofs) if dof in ROTATIONAL_DOF_MAP]
+
+
+def validate_no_rotational_prescribed_motion_node_dofs(prescribed_dofs, *, context: str) -> None:
+    if rotational_prescribed_dofs(prescribed_dofs):
+        raise ValueError(UNSUPPORTED_ROTATIONAL_PRESCRIBED_MOTION_NODE_MESSAGE)
+
+
 @dataclass
 class ModeShape:
     mode_number: int
@@ -87,11 +102,7 @@ def encode_translational_prescribed_motion_dof(dof: str) -> int:
     """Encode only supported translational DOF for *BOUNDARY_PRESCRIBED_MOTION_NODE."""
     normalized = str(dof).upper()
     if normalized not in TRANSLATIONAL_DOF_MAP:
-        raise ValueError(
-            "Вращательные DOF для *BOUNDARY_PRESCRIBED_MOTION_NODE пока не поддержаны "
-            f"без отдельного LS-DYNA keyword/DEFINE_VECTOR encoding: {dof}. "
-            "Используйте primary_step_prescribed_mode='translational' или prescribed_dofs=['UX','UY','UZ']."
-        )
+        raise ValueError(UNSUPPORTED_ROTATIONAL_PRESCRIBED_MOTION_NODE_MESSAGE)
     return TRANSLATIONAL_DOF_MAP[normalized]
 
 
@@ -287,6 +298,11 @@ def normalize_config(config: dict) -> dict:
         "step_expected_reaction_source",
         "applied_load_manifest" if cfg["step_load_scheme"] == "surface_nodal_force_step" else "bndout",
     ))
+    if cfg["step_load_scheme"] == "prescribed_motion_step" and cfg["prescribed_dofs"] != "auto":
+        validate_no_rotational_prescribed_motion_node_dofs(
+            cfg["prescribed_dofs"],
+            context="normalize_config prescribed_motion_step",
+        )
     return cfg
 
 
@@ -871,11 +887,11 @@ def resolve_case_prescribed_dofs(config: dict, model_info: dict) -> List[str]:
     family = str(model_info.get("family", "solid")).lower()
 
     if mode == "auto":
-        if family == "shell" and model_info.get("rotations_present", False):
-            return ["UX", "UY", "UZ", "ROTX", "ROTY", "ROTZ"]
-        if family == "solid":
-            return ["UX", "UY", "UZ"]
-        if family == "mixed":
+        # Classic STEP prescribed motion is generated through
+        # *BOUNDARY_PRESCRIBED_MOTION_NODE in this generator. Keep auto strictly
+        # translational so shell/solid cases preserve the full translational
+        # modal shape and never fall back to unsupported ROT* node DOF.
+        if family in ("shell", "solid", "mixed"):
             return ["UX", "UY", "UZ"]
         return [normal_dof]
 
@@ -1156,13 +1172,10 @@ def build_motion_records(
     excluded_nodes=None,
     prescribed_nodes: Optional[Set[int]] = None,
 ):
-    rotational = [dof for dof in prescribed_dofs if str(dof).upper() in ROTATIONAL_DOF_MAP]
-    if rotational:
-        raise ValueError(
-            "build_motion_records() пишет только поступательные *BOUNDARY_PRESCRIBED_MOTION_NODE DOF. "
-            f"Вращательные shell DOF {rotational} должны идти через build_shell_motion_records()/"
-            "build_shell_boundary_prescribed_motion_block(), а не через encode_translational_prescribed_motion_dof()."
-        )
+    validate_no_rotational_prescribed_motion_node_dofs(
+        prescribed_dofs,
+        context="build_motion_records",
+    )
     return _build_motion_records_for_dofs(
         q_vector,
         mode_shapes,
@@ -2640,6 +2653,17 @@ def generate_step_cases_for_bc(case_dir: Path, config: dict) -> List[Path]:
 
     model_info = detect_model_info(base_key_lines, mode_shapes, config)
     prescribed_dofs = resolve_case_prescribed_dofs(config, model_info)
+    step_load_scheme = str(config.get("step_load_scheme", "prescribed_motion_step")).lower()
+    if step_load_scheme == "prescribed_motion_step":
+        validate_no_rotational_prescribed_motion_node_dofs(
+            prescribed_dofs,
+            context=f"{case_dir.name} prescribed_motion_step",
+        )
+    primary_step_prescribed_mode_resolved = (
+        "translational"
+        if step_load_scheme == "prescribed_motion_step" and prescribed_dofs == ["UX", "UY", "UZ"]
+        else str(config.get("primary_step_prescribed_mode", "auto"))
+    )
     setup_validation = validate_primary_step_setup(
         case_dir=case_dir,
         config=config,
@@ -2648,7 +2672,6 @@ def generate_step_cases_for_bc(case_dir: Path, config: dict) -> List[Path]:
         mode_shapes=mode_shapes,
         selected_modes=selected_modes,
     )
-    step_load_scheme = str(config.get("step_load_scheme", "surface_nodal_force_step")).lower()
     if step_load_scheme == "surface_nodal_force_step":
         q_settings = resolve_case_lambda_settings(config)
     else:
@@ -2727,7 +2750,7 @@ def generate_step_cases_for_bc(case_dir: Path, config: dict) -> List[Path]:
         "model_info": model_info,
         "prescribed_dofs": prescribed_dofs,
         "setup_validation": setup_validation,
-        "primary_step_prescribed_mode_resolved": config.get("primary_step_prescribed_mode", "auto"),
+        "primary_step_prescribed_mode_resolved": primary_step_prescribed_mode_resolved,
         "step_load_scheme": step_load_scheme,
         "step_control_basis": "lambda" if step_load_scheme == "surface_nodal_force_step" else "q",
         "requires_fitted_fe_q": bool(config.get("step_requires_fitted_fe_q", step_load_scheme != "prescribed_motion_step")),
@@ -2925,7 +2948,7 @@ def generate_step_cases_for_bc(case_dir: Path, config: dict) -> List[Path]:
             "resolved_model_family": model_info.get("family"),
             "model_family_requested": model_info.get("requested_family", config.get("model_family", "auto")),
             "model_family_resolved": model_info.get("family"),
-            "primary_step_prescribed_mode_resolved": config.get("primary_step_prescribed_mode", "auto"),
+            "primary_step_prescribed_mode_resolved": primary_step_prescribed_mode_resolved,
             "step_load_scheme": step_load_scheme,
             "step_control_basis": "lambda" if step_load_scheme == "surface_nodal_force_step" else "q",
             "requires_fitted_fe_q": bool(config.get("step_requires_fitted_fe_q", step_load_scheme != "prescribed_motion_step")),
