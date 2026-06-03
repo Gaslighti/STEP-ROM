@@ -921,18 +921,114 @@ def avg_vectors(vectors: List[np.ndarray]) -> np.ndarray:
     return np.mean(np.vstack(vectors), axis=0)
 
 
+def _format_q_values(q_values: Sequence[float]) -> str:
+    if not q_values:
+        return "[]"
+    return "[" + ", ".join(f"{float(q):.12g}" for q in q_values) + "]"
+
+
+def _manifest_q_settings(cfg: Optional[dict]) -> dict:
+    if not isinstance(cfg, dict):
+        return {}
+    manifest = cfg.get("_step_manifest")
+    if not isinstance(manifest, dict):
+        return {}
+    q_settings = manifest.get("q_settings")
+    return q_settings if isinstance(q_settings, dict) else {}
+
+
+def _canonical_q_filter_threshold(cfg: Optional[dict]) -> Tuple[float, float, List[float], str, str]:
+    cfg = cfg if isinstance(cfg, dict) else {}
+    q_settings = _manifest_q_settings(cfg)
+    model_info = cfg.get("_step_model_info", {}) if isinstance(cfg.get("_step_model_info", {}), dict) else {}
+    family = str(cfg.get("resolved_model_family") or model_info.get("family") or cfg.get("model_family", "auto")).strip().lower()
+    q_auto_source = str(q_settings.get("q_auto_source", cfg.get("q_auto_source", ""))).strip().lower()
+
+    min_abs = float(cfg.get("min_step_q_for_coefficients", 0.0) or 0.0)
+    if not math.isfinite(min_abs) or min_abs < 0.0:
+        raise ValueError("min_step_q_for_coefficients должен быть конечным числом >= 0.")
+
+    rel = float(cfg.get("relative_step_q_for_coefficients", 0.0) or 0.0)
+    if not math.isfinite(rel) or rel < 0.0:
+        raise ValueError("relative_step_q_for_coefficients должен быть конечным числом >= 0.")
+
+    shell_values: List[float] = []
+    raw_shell_values = cfg.get("shell_q_sweep_values", [])
+    if isinstance(raw_shell_values, (list, tuple)):
+        for raw in raw_shell_values:
+            try:
+                q = float(raw)
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(q) and q > 0.0:
+                shell_values.append(q)
+    shell_values = sorted(set(shell_values))
+
+    source_reason = "config_threshold"
+    if family == "shell" and q_auto_source.startswith("solid_") and shell_values:
+        min_abs = max(min_abs, min(shell_values))
+        source_reason = f"shell_excludes_{q_auto_source}"
+
+    return min_abs, rel, shell_values, q_auto_source, source_reason
+
+
+def _filter_q_values_for_coefficients(q_values: Sequence[float], cfg: Optional[dict], label: str) -> Tuple[List[float], dict]:
+    min_abs, rel, shell_values, q_auto_source, source_reason = _canonical_q_filter_threshold(cfg)
+    q_all = sorted({float(q) for q in q_values if math.isfinite(float(q)) and float(q) > 0.0})
+    q_rel_threshold = (max(q_all) * rel) if q_all and rel > 0.0 else 0.0
+    threshold = max(min_abs, q_rel_threshold)
+    used = [q for q in q_all if q >= threshold]
+    dropped = [q for q in q_all if q < threshold]
+    info = {
+        "label": label,
+        "all_q": q_all,
+        "used_q": used,
+        "dropped_q": dropped,
+        "threshold": threshold,
+        "min_step_q_for_coefficients": min_abs,
+        "relative_step_q_for_coefficients": rel,
+        "relative_threshold": q_rel_threshold,
+        "q_auto_source": q_auto_source,
+        "source_reason": source_reason,
+        "shell_q_sweep_values": shell_values,
+    }
+    return used, info
+
+
+
+def _log_canonical_q(logger: logging.Logger, message: str, *args: object) -> None:
+    logger.info(message, *args)
+    print("[INFO] " + (message % args))
+
+def _require_nonempty_filtered_q(info: dict, requirement: str) -> None:
+    if info.get("used_q"):
+        return
+    raise ValueError(
+        f"После фильтрации q не осталось данных для {requirement}. "
+        f"Все q={_format_q_values(info.get('all_q', []))}, "
+        f"отброшены={_format_q_values(info.get('dropped_q', []))}, "
+        f"порог={float(info.get('threshold', 0.0)):.12g}, "
+        f"q_auto_source={info.get('q_auto_source') or 'unknown'}. "
+        "Увеличьте STEP q-sweep (для shell используйте shell_q_sweep_values) "
+        "или уменьшите min_step_q_for_coefficients/relative_step_q_for_coefficients."
+    )
+
+
 def extract_canonical_step_coefficients(
     experiments: Dict[str, StepExperiment],
     selected_modes: Sequence[int],
+    cfg: Optional[dict] = None,
 ) -> Dict[str, object]:
     selected_modes = list(selected_modes)
     n = len(selected_modes)
     idx = build_experiment_index(experiments, selected_modes)
+    logger = logging.getLogger(__name__)
 
     K = np.zeros((n, n), dtype=float)
     G = np.zeros((n, n, n), dtype=float)
     H = np.zeros((n, n, n, n), dtype=float)
 
+    q_filter_info: Dict[str, dict] = {"single": {}, "pair": {}, "triple": {}}
     single_gamma_pos: Dict[Tuple[int, float], np.ndarray] = {}
     single_gamma_neg: Dict[Tuple[int, float], np.ndarray] = {}
 
@@ -942,18 +1038,25 @@ def extract_canonical_step_coefficients(
             _, r, _sgn, q = key
             q_values_by_mode[r].append(q)
     for r in q_values_by_mode:
-        q_values_by_mode[r] = sorted(set(q_values_by_mode[r]))
+        used, info = _filter_q_values_for_coefficients(q_values_by_mode[r], cfg, f"single mode {r}")
+        q_values_by_mode[r] = used
+        q_filter_info["single"][str(r)] = info
 
     for r in selected_modes:
         K_cols = []
         Grr_rows = []
         Hrrr_rows = []
+        _require_nonempty_filtered_q(q_filter_info["single"][str(r)], f"mode {r}: complete single +/-")
+        _log_canonical_q(logger, "Canonical STEP q for mode %s single +/-: %s", r, _format_q_values(q_values_by_mode[r]))
 
         for q in q_values_by_mode[r]:
             ep = idx.get(("single", r, +1, q))
             em = idx.get(("single", r, -1, q))
             if ep is None or em is None or ep.gamma_force is None or em.gamma_force is None or ep.lin_force is None or em.lin_force is None:
-                raise ValueError(f"Для mode {r} и q={q} отсутствуют полные single +/- STEP данные.")
+                raise ValueError(
+                    f"Для mode {r} и q={q:.12g} отсутствует полный набор single +/- STEP данных после фильтрации q. "
+                    "Проверьте наличие lin/nl реакций для +q и -q."
+                )
 
             single_gamma_pos[(r, q)] = ep.gamma_force.copy()
             single_gamma_neg[(r, q)] = em.gamma_force.copy()
@@ -976,10 +1079,37 @@ def extract_canonical_step_coefficients(
         if key[0] == "pair":
             _, r, _sr, s, _ss, q = key
             q_values_by_pair.setdefault((r, s), []).append(q)
-    for p in q_values_by_pair:
-        q_values_by_pair[p] = sorted(set(q_values_by_pair[p]))
 
-    for (r, s), qvals in q_values_by_pair.items():
+    expected_pairs = sorted({tuple(sorted((selected_modes[i], selected_modes[j]))) for i in range(n) for j in range(i + 1, n)})
+    for pair in expected_pairs:
+        q_values_by_pair.setdefault(pair, [])
+
+    processed_pairs = set()
+    for p in expected_pairs:
+        used, info = _filter_q_values_for_coefficients(q_values_by_pair[p], cfg, f"pair {p}")
+        r, s = p
+        complete_used = []
+        incomplete = []
+        for q in used:
+            has_pair = all(
+                (idx.get(("pair", r, sr, s, ss, q)) is not None and idx[("pair", r, sr, s, ss, q)].gamma_force is not None)
+                for sr, ss in ((+1, +1), (-1, +1), (+1, -1))
+            )
+            has_single = all((mode, q) in single_gamma_pos and (mode, q) in single_gamma_neg for mode in (r, s))
+            if has_pair and has_single:
+                complete_used.append(q)
+            else:
+                incomplete.append(q)
+        info["used_q_before_completeness"] = list(used)
+        info["incomplete_q"] = incomplete
+        info["used_q"] = complete_used
+        q_values_by_pair[p] = complete_used
+        q_filter_info["pair"][f"{r},{s}"] = info
+
+    for (r, s) in expected_pairs:
+        qvals = q_values_by_pair[(r, s)]
+        _require_nonempty_filtered_q(q_filter_info["pair"][f"{r},{s}"], f"pair ({r},{s}): pair +/+,-/+,+/- plus matching single +/-")
+        _log_canonical_q(logger, "Canonical STEP q for pair (%s,%s): %s", r, s, _format_q_values(qvals))
         ir = selected_modes.index(r)
         is_ = selected_modes.index(s)
 
@@ -993,7 +1123,7 @@ def extract_canonical_step_coefficients(
             e_pm = idx.get(("pair", r, +1, s, -1, q))
 
             if any(e is None or e.gamma_force is None for e in [e_pp, e_mp, e_pm]):
-                raise ValueError(f"Для пары ({r},{s}) и q={q} отсутствуют нужные pair STEP данные.")
+                raise ValueError(f"Для пары ({r},{s}) и q={q:.12g} отсутствуют нужные pair STEP данные после фильтрации q.")
 
             sr_p = single_gamma_pos[(r, q)]
             sr_m = single_gamma_neg[(r, q)]
@@ -1015,6 +1145,7 @@ def extract_canonical_step_coefficients(
         g_rs_avg = avg_vectors(g_rs_all)
         h_rrs_avg = avg_vectors(h_rrs_all)
         h_rss_avg = avg_vectors(h_rss_all)
+        processed_pairs.add((r, s))
 
         G[:, ir, is_] = g_rs_avg
         G[:, is_, ir] = g_rs_avg
@@ -1032,10 +1163,41 @@ def extract_canonical_step_coefficients(
         if key[0] == "triple":
             _, r, _sr, s, _ss, t, _st, q = key
             q_values_by_triple.setdefault((r, s, t), []).append(q)
-    for triad in q_values_by_triple:
-        q_values_by_triple[triad] = sorted(set(q_values_by_triple[triad]))
 
-    for (r, s, t), qvals in q_values_by_triple.items():
+    expected_triples = sorted({
+        tuple(sorted((selected_modes[i], selected_modes[j], selected_modes[k])))
+        for i in range(n)
+        for j in range(i + 1, n)
+        for k in range(j + 1, n)
+    })
+    for triple in expected_triples:
+        q_values_by_triple.setdefault(triple, [])
+
+    for triad in expected_triples:
+        used, info = _filter_q_values_for_coefficients(q_values_by_triple[triad], cfg, f"triple {triad}")
+        r, s, t = triad
+        complete_used = []
+        incomplete = []
+        required_pairs = ((r, s), (r, t), (s, t))
+        for q in used:
+            e_ppp = idx.get(("triple", r, +1, s, +1, t, +1, q))
+            has_triple = e_ppp is not None and e_ppp.gamma_force is not None
+            has_single = all((mode, q) in single_gamma_pos for mode in (r, s, t))
+            has_pair_coefficients = all(pair in processed_pairs for pair in required_pairs)
+            if has_triple and has_single and has_pair_coefficients:
+                complete_used.append(q)
+            else:
+                incomplete.append(q)
+        info["used_q_before_completeness"] = list(used)
+        info["incomplete_q"] = incomplete
+        info["used_q"] = complete_used
+        q_values_by_triple[triad] = complete_used
+        q_filter_info["triple"][f"{r},{s},{t}"] = info
+
+    for (r, s, t) in expected_triples:
+        qvals = q_values_by_triple[(r, s, t)]
+        _require_nonempty_filtered_q(q_filter_info["triple"][f"{r},{s},{t}"], f"triple ({r},{s},{t}): triple +++ plus matching single/pair coefficients")
+        _log_canonical_q(logger, "Canonical STEP q for triple (%s,%s,%s): %s", r, s, t, _format_q_values(qvals))
         ir = selected_modes.index(r)
         is_ = selected_modes.index(s)
         it = selected_modes.index(t)
@@ -1045,7 +1207,7 @@ def extract_canonical_step_coefficients(
         for q in qvals:
             e_ppp = idx.get(("triple", r, +1, s, +1, t, +1, q))
             if e_ppp is None or e_ppp.gamma_force is None:
-                raise ValueError(f"Для тройки ({r},{s},{t}) и q={q} отсутствует triple +++ STEP данные.")
+                raise ValueError(f"Для тройки ({r},{s},{t}) и q={q:.12g} отсутствует triple +++ STEP данные после фильтрации q.")
 
             gr = single_gamma_pos[(r, q)]
             gs = single_gamma_pos[(s, q)]
@@ -1073,6 +1235,7 @@ def extract_canonical_step_coefficients(
         "G": G,
         "H": H,
         "experiments_index_size": len(idx),
+        "q_filter_info": q_filter_info,
     }
 
 
@@ -2129,10 +2292,11 @@ def process_bc(case_dir: Path, cfg: dict) -> Dict[str, str]:
     )
     experiments = list(experiments_map.values())
 
-    step_coeffs = extract_canonical_step_coefficients(experiments_map, selected_modes)
+    step_coeffs = extract_canonical_step_coefficients(experiments_map, selected_modes, local_cfg)
     K = step_coeffs["K"]
     G = step_coeffs["G"]
     H = step_coeffs["H"]
+    q_filter_info = step_coeffs.get("q_filter_info", {})
 
     summary_csv = rom_dir / cfg["step_summary_csv_filename"]
     coeff_json = rom_dir / cfg["coefficients_json_filename"]
@@ -2231,6 +2395,7 @@ def process_bc(case_dir: Path, cfg: dict) -> Dict[str, str]:
             "normal_dof_meta": normal_meta,
             "d3plot_reference_meta": local_cfg.get("_d3plot_reference_meta", {}),
             "force_path_diagnostics": local_cfg.get("_force_path_diagnostics", []),
+            "q_filter_info": q_filter_info,
             "K": K.tolist(),
             "G": G.tolist(),
             "H": H.tolist(),
@@ -2257,6 +2422,8 @@ def process_bc(case_dir: Path, cfg: dict) -> Dict[str, str]:
         lines.append(f"WARNING step_manifest                   = {local_cfg['_step_manifest_warning']}")
     if local_cfg.get("_rom_thickness_warning"):
         lines.append(f"WARNING thickness                       = {local_cfg['_rom_thickness_warning']}")
+    lines.append(f"min_step_q_for_coefficients             = {local_cfg.get('min_step_q_for_coefficients', 0.0)}")
+    lines.append(f"relative_step_q_for_coefficients        = {local_cfg.get('relative_step_q_for_coefficients', 0.0)}")
     ref_meta = local_cfg.get("_d3plot_reference_meta", {})
     if ref_meta:
         lines.append(f"d3plot_reference_state                 = {ref_meta.get('mode')}")
