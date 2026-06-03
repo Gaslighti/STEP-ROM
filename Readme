@@ -21,6 +21,30 @@ python main.py
 
 JSON-конфигурации больше не используются. Все штатные настройки этапов находятся в коде проекта в `step_rom/defaults.py`, а пользовательские значения подставляются во время запуска.
 
+### Runtime overrides для ручного запуска
+
+Встроенные defaults рассчитаны на автоматическое определение типа модели. Если для
+ручного shell-сценария нужно принудительно отключить auto-detect, передайте runtime
+override в `PipelineInput`:
+
+```python
+from pathlib import Path
+
+from step_rom.configuration import PipelineInput
+from step_rom.pipeline import StepRomPipeline
+
+pipeline_input = PipelineInput(
+    project_archive=Path("/path/to/project.wbpz"),
+    is_parameterized=False,
+    runtime_config={
+        "generate_k": {"model_family": "shell"},
+    },
+)
+```
+
+Для обычного смешанного/solid/shell пайплайна override не нужен: `generate_k.model_family`
+по умолчанию равен `auto`, а `rom.thickness` берется из STEP manifest с fallback `1.0`.
+
 ## Логирование
 
 Подробный лог каждого запуска пишется в файл:
