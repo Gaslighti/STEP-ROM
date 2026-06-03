@@ -2554,18 +2554,23 @@ def validate_prescribed_motion_writer_availability(
     rotational = [dof for dof in prescribed_dofs if str(dof).upper() in ROTATIONAL_DOF_MAP]
     if not rotational:
         return
-    if family == "solid":
-        raise RuntimeError(
-            f"{case_dir.name}: {context} solid-модель не должна содержать вращательные prescribed DOF: "
-            f"{prescribed_dofs}. ROT* сохраняются только для shell-моделей."
-        )
-    if family == "shell" and not bool(config.get("enable_shell_rotational_prescribed_motion_writer", True)):
-        raise RuntimeError(
-            f"{case_dir.name}: {context} shell prescribed_dofs содержит вращательные DOF {rotational}, "
-            "но shell rotational writer отключен/недоступен "
-            "(enable_shell_rotational_prescribed_motion_writer=false). "
-            "Генерация .k остановлена до записи, чтобы не получить translational-only fallback."
-        )
+    raise RuntimeError(
+        f"{case_dir.name}: {context} model_family={family} не должен содержать "
+        f"вращательные prescribed DOF {rotational}: {prescribed_dofs}. "
+        "Classic prescribed_motion_step в этом генераторе безопасно поддерживает "
+        "только translational DOF UX/UY/UZ; задайте primary_step_prescribed_mode='auto' "
+        "или prescribed_dofs=['UX', 'UY', 'UZ']."
+    )
+
+
+def count_translational_motion_records(motion_records) -> int:
+    translational_ids = set(TRANSLATIONAL_DOF_MAP.values())
+    return sum(
+        1
+        for _nid, dof_id, _sf_value in motion_records
+        if int(dof_id) in translational_ids
+    )
+
 
 def validate_primary_step_setup(
     *,
@@ -2602,12 +2607,10 @@ def validate_primary_step_setup(
                     f"но получено prescribed_dofs={prescribed_dofs}."
                 )
         else:
-            # Для объемной постановки не допускаем ROT*-DOF и требуем, чтобы
-            # нормальный DOF входил в заданное модальное поле.
-            if any(str(d).upper().startswith("ROT") for d in prescribed_dofs):
-                raise RuntimeError(
-                    f"{case_dir.name}: solid STEP не должен содержать вращательные DOF: {prescribed_dofs}."
-                )
+            # Safe classic STEP uses the full translational modal field.  Do
+            # not require rotations for shells and do not allow ROT* for any
+            # family; validate_prescribed_motion_writer_availability() enforces
+            # the latter before writer selection.
             if normal_dof not in prescribed_dofs:
                 raise RuntimeError(
                     f"{case_dir.name}: solid STEP не содержит нормальный DOF {normal_dof}: {prescribed_dofs}."
@@ -2864,7 +2867,7 @@ def generate_step_cases_for_bc(case_dir: Path, config: dict) -> List[Path]:
                 "expected_reaction_source": "bndout",
                 "preflight": preflight,
                 "prescribed_dofs": prescribed_dofs,
-                "motion_record_count": len(motion_records),
+                "motion_record_count": count_translational_motion_records(motion_records),
                 "prescribed_node_info": prescribed_node_info,
             }
 
@@ -2933,7 +2936,7 @@ def generate_step_cases_for_bc(case_dir: Path, config: dict) -> List[Path]:
             "q_vector": {str(k): float(v) for k, v in sorted(q_vector.items())},
             "dual_prescribed_mode": dual_prescribed_mode_for_case,
             "dual_prescribed_dofs": dual_prescribed_dofs_for_case,
-            "motion_record_count": len(motion_records),
+            "motion_record_count": count_translational_motion_records(motion_records),
             "prescribed_node_info": prescribed_node_info,
         })
 
