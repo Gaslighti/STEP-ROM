@@ -14,7 +14,8 @@ import numpy as np
 FIELD_WIDTH = 10
 VALID_DOFS = ("UX", "UY", "UZ", "ROTX", "ROTY", "ROTZ")
 TRANSLATIONAL_DOF_MAP = {"UX": 1, "UY": 2, "UZ": 3}
-ROTATIONAL_DOF_IDS = {4, 5, 6}
+ROTATIONAL_DOF_MAP = {"ROTX": 4, "ROTY": 5, "ROTZ": 6}
+ROTATIONAL_DOF_IDS = set(ROTATIONAL_DOF_MAP.values())
 FILENAME_MODE_RE = re.compile(r"mode[^0-9]*([0-9]+)", re.IGNORECASE)
 
 
@@ -136,6 +137,7 @@ def normalize_config(config: dict) -> dict:
     if cfg["primary_step_prescribed_mode"] not in ("auto", "full", "normal_only", "translational", "normal_plus_rotations"):
         raise ValueError("primary_step_prescribed_mode должен быть auto, full, normal_only, translational или normal_plus_rotations.")
     cfg["strict_solid_normal_step_guard"] = bool(cfg.get("strict_solid_normal_step_guard", True))
+    cfg["enable_shell_rotational_prescribed_motion_writer"] = bool(cfg.get("enable_shell_rotational_prescribed_motion_writer", True))
     cfg["min_normal_content_ratio_for_selected_modes"] = float(cfg.get("min_normal_content_ratio_for_selected_modes", 1.0e-6))
     cfg["allow_low_normal_content_modes"] = bool(cfg.get("allow_low_normal_content_modes", False))
     cfg["projection_dofs"] = normalize_dofs_or_auto(cfg.get("projection_dofs", ["UX", "UY", "UZ"]), "projection_dofs")
@@ -1084,14 +1086,11 @@ def resolve_case_q_settings(case_dir: Path, config: dict, model_info: dict) -> d
     )
 
 
-def build_motion_records(
-    q_vector,
-    mode_shapes,
-    prescribed_dofs,
-    zero_tol,
-    excluded_nodes=None,
+def _active_motion_nodes(
+    mode_shapes: Dict[int, ModeShape],
+    excluded_nodes: Optional[Set[int]] = None,
     prescribed_nodes: Optional[Set[int]] = None,
-):
+) -> List[int]:
     base_mode = next(iter(mode_shapes.values()))
     all_nodes = sorted(base_mode.node_values.keys())
     for mode_number, shape in mode_shapes.items():
@@ -1099,7 +1098,20 @@ def build_motion_records(
             raise ValueError(f"Набор узлов у mode {mode_number} не совпадает с остальными mode-файлами.")
     excluded_nodes = excluded_nodes or set()
     allowed_nodes = set(all_nodes) if prescribed_nodes is None else (set(prescribed_nodes) & set(all_nodes))
-    active_nodes = [nid for nid in all_nodes if nid in allowed_nodes and nid not in excluded_nodes]
+    return [nid for nid in all_nodes if nid in allowed_nodes and nid not in excluded_nodes]
+
+
+def _build_motion_records_for_dofs(
+    q_vector,
+    mode_shapes,
+    prescribed_dofs,
+    zero_tol,
+    excluded_nodes=None,
+    prescribed_nodes: Optional[Set[int]] = None,
+    *,
+    dof_encoder,
+):
+    active_nodes = _active_motion_nodes(mode_shapes, excluded_nodes, prescribed_nodes)
     target = {nid: {dof: 0.0 for dof in prescribed_dofs} for nid in active_nodes}
     for mode_number, q_value in q_vector.items():
         if abs(q_value) <= 1.0e-30:
@@ -1114,10 +1126,98 @@ def build_motion_records(
             value = target[nid][dof]
             if abs(value) <= zero_tol:
                 continue
-            records.append((nid, encode_translational_prescribed_motion_dof(dof), value))
+            records.append((nid, dof_encoder(dof), value))
     return records
 
 
+def build_motion_records(
+    q_vector,
+    mode_shapes,
+    prescribed_dofs,
+    zero_tol,
+    excluded_nodes=None,
+    prescribed_nodes: Optional[Set[int]] = None,
+):
+    rotational = [dof for dof in prescribed_dofs if str(dof).upper() in ROTATIONAL_DOF_MAP]
+    if rotational:
+        raise ValueError(
+            "build_motion_records() пишет только поступательные *BOUNDARY_PRESCRIBED_MOTION_NODE DOF. "
+            f"Вращательные shell DOF {rotational} должны идти через build_shell_motion_records()/"
+            "build_shell_boundary_prescribed_motion_block(), а не через encode_translational_prescribed_motion_dof()."
+        )
+    return _build_motion_records_for_dofs(
+        q_vector,
+        mode_shapes,
+        prescribed_dofs,
+        zero_tol,
+        excluded_nodes,
+        prescribed_nodes,
+        dof_encoder=encode_translational_prescribed_motion_dof,
+    )
+
+
+def encode_shell_rotational_prescribed_motion_dof(dof: str) -> int:
+    normalized = str(dof).upper()
+    if normalized not in ROTATIONAL_DOF_MAP:
+        raise ValueError(f"Ожидался shell rotational DOF ROTX/ROTY/ROTZ, получено: {dof}.")
+    return ROTATIONAL_DOF_MAP[normalized]
+
+
+def build_shell_rotational_motion_records(
+    q_vector,
+    mode_shapes,
+    prescribed_dofs,
+    zero_tol,
+    excluded_nodes=None,
+    prescribed_nodes: Optional[Set[int]] = None,
+):
+    non_rotational = [dof for dof in prescribed_dofs if str(dof).upper() not in ROTATIONAL_DOF_MAP]
+    if non_rotational:
+        raise ValueError(
+            "build_shell_rotational_motion_records() принимает только ROTX/ROTY/ROTZ; "
+            f"получено {non_rotational}."
+        )
+    return _build_motion_records_for_dofs(
+        q_vector,
+        mode_shapes,
+        prescribed_dofs,
+        zero_tol,
+        excluded_nodes,
+        prescribed_nodes,
+        dof_encoder=encode_shell_rotational_prescribed_motion_dof,
+    )
+
+
+def build_shell_motion_records(
+    q_vector,
+    mode_shapes,
+    prescribed_dofs,
+    zero_tol,
+    excluded_nodes=None,
+    prescribed_nodes: Optional[Set[int]] = None,
+):
+    translational = [dof for dof in prescribed_dofs if str(dof).upper() in TRANSLATIONAL_DOF_MAP]
+    rotational = [dof for dof in prescribed_dofs if str(dof).upper() in ROTATIONAL_DOF_MAP]
+    records = []
+    if translational:
+        records.extend(build_motion_records(
+            q_vector,
+            mode_shapes,
+            translational,
+            zero_tol,
+            excluded_nodes,
+            prescribed_nodes=prescribed_nodes,
+        ))
+    if rotational:
+        records.extend(build_shell_rotational_motion_records(
+            q_vector,
+            mode_shapes,
+            rotational,
+            zero_tol,
+            excluded_nodes,
+            prescribed_nodes=prescribed_nodes,
+        ))
+    return records
 
 
 def build_dual_motion_records(
@@ -1129,6 +1229,7 @@ def build_dual_motion_records(
     *,
     dual_prescribed_mode: str = "normal_only",
     dual_prescribed_dofs: Optional[List[str]] = None,
+    allow_shell_rotations: bool = False,
 ) -> List[Tuple[int, int, float]]:
     """
     Dual-deck не должен задавать весь вектор модальной формы (UX, UY, UZ),
@@ -1166,15 +1267,36 @@ def build_dual_motion_records(
     allowed_nodes = set(all_nodes) if prescribed_nodes is None else (set(prescribed_nodes) & set(all_nodes))
     active_nodes = [nid for nid in all_nodes if nid in allowed_nodes and nid not in excluded_nodes]
 
+    rotational = [dof for dof in prescribed_dofs if str(dof).upper() in ROTATIONAL_DOF_MAP]
+    if rotational and not allow_shell_rotations:
+        raise ValueError(
+            "Dual prescribed motion получил ROTX/ROTY/ROTZ для non-shell writer. "
+            f"prescribed_dofs={prescribed_dofs}"
+        )
+
     records: List[Tuple[int, int, float]] = []
 
     for nid in active_nodes:
         for dof in prescribed_dofs:
             value = q_value * shape.node_values[nid][dof]
             if abs(value) > zero_tol:
-                records.append((nid, encode_translational_prescribed_motion_dof(dof), float(value)))
+                if str(dof).upper() in ROTATIONAL_DOF_MAP:
+                    dof_id = encode_shell_rotational_prescribed_motion_dof(dof)
+                else:
+                    dof_id = encode_translational_prescribed_motion_dof(dof)
+                records.append((nid, dof_id, float(value)))
 
     return records
+
+
+def _format_boundary_prescribed_motion_node_records(motion_records, curve_id):
+    lines = []
+    for nid, dof_id, sf_value in motion_records:
+        lines.append("*BOUNDARY_PRESCRIBED_MOTION_NODE")
+        lines.append("$#     nid       dof       vad      lcid        sf       vid     death     birth")
+        lines.append(f"{field10(nid)}{field10(dof_id)}{field10(2)}{field10(curve_id)}{float10_sf(sf_value)}{field10(0)}{field10('1.0E28')}{field10('0.0')}")
+    return lines
+
 
 def build_boundary_prescribed_motion_node_block(motion_records, curve_id):
     validate_prescribed_motion_node_records(
@@ -1182,12 +1304,17 @@ def build_boundary_prescribed_motion_node_block(motion_records, curve_id):
         context="Перед записью .k",
         vid=0,
     )
-    lines = []
-    for nid, dof_id, sf_value in motion_records:
-        lines.append("*BOUNDARY_PRESCRIBED_MOTION_NODE")
-        lines.append("$#     nid       dof       vad      lcid        sf       vid     death     birth")
-        lines.append(f"{field10(nid)}{field10(dof_id)}{field10(2)}{field10(curve_id)}{float10_sf(sf_value)}{field10(0)}{field10('1.0E28')}{field10('0.0')}")
-    return lines
+    return _format_boundary_prescribed_motion_node_records(motion_records, curve_id)
+
+
+def build_shell_boundary_prescribed_motion_block(motion_records, curve_id):
+    """Write shell translational and rotational prescribed-motion records.
+
+    Shell rotations are intentionally handled by this dedicated writer so ROTX/ROTY/ROTZ
+    never flow through encode_translational_prescribed_motion_dof().  The rotational
+    records use LS-DYNA nodal rotational DOF ids 4/5/6 for shell nodes.
+    """
+    return _format_boundary_prescribed_motion_node_records(motion_records, curve_id)
 
 
 def field10_label(text: object) -> str:
@@ -2383,6 +2510,32 @@ def mode_normal_content_ratio(shape: ModeShape, normal_dof: str) -> float:
     return float(normal_max / max(transl_max, 1.0e-30))
 
 
+
+def validate_prescribed_motion_writer_availability(
+    *,
+    case_dir: Path,
+    config: dict,
+    model_info: dict,
+    prescribed_dofs: List[str],
+    context: str = "STEP",
+) -> None:
+    family = str(model_info.get("family", "solid")).lower()
+    rotational = [dof for dof in prescribed_dofs if str(dof).upper() in ROTATIONAL_DOF_MAP]
+    if not rotational:
+        return
+    if family == "solid":
+        raise RuntimeError(
+            f"{case_dir.name}: {context} solid-модель не должна содержать вращательные prescribed DOF: "
+            f"{prescribed_dofs}. ROT* сохраняются только для shell-моделей."
+        )
+    if family == "shell" and not bool(config.get("enable_shell_rotational_prescribed_motion_writer", True)):
+        raise RuntimeError(
+            f"{case_dir.name}: {context} shell prescribed_dofs содержит вращательные DOF {rotational}, "
+            "но shell rotational writer отключен/недоступен "
+            "(enable_shell_rotational_prescribed_motion_writer=false). "
+            "Генерация .k остановлена до записи, чтобы не получить translational-only fallback."
+        )
+
 def validate_primary_step_setup(
     *,
     case_dir: Path,
@@ -2400,6 +2553,14 @@ def validate_primary_step_setup(
         str(m): mode_normal_content_ratio(mode_shapes[m], normal_dof)
         for m in selected_modes
     }
+
+    validate_prescribed_motion_writer_availability(
+        case_dir=case_dir,
+        config=config,
+        model_info=model_info,
+        prescribed_dofs=prescribed_dofs,
+        context="primary STEP",
+    )
 
     if family == "solid" and bool(config.get("strict_solid_normal_step_guard", True)):
         mode = str(config.get("primary_step_prescribed_mode", "auto")).lower()
@@ -2624,20 +2785,33 @@ def generate_step_cases_for_bc(case_dir: Path, config: dict) -> List[Path]:
                 prescribed_nodes=prescribed_nodes,
             )
             case_name = qvec_to_case_name(q_vector)
-            motion_records = build_motion_records(
-                q_vector,
-                mode_shapes,
-                prescribed_dofs,
-                config["zero_tol"],
-                excluded_nodes,
-                prescribed_nodes=prescribed_nodes,
-            )
+            if str(model_info.get("family", "solid")).lower() == "shell":
+                motion_records = build_shell_motion_records(
+                    q_vector,
+                    mode_shapes,
+                    prescribed_dofs,
+                    config["zero_tol"],
+                    excluded_nodes,
+                    prescribed_nodes=prescribed_nodes,
+                )
+            else:
+                motion_records = build_motion_records(
+                    q_vector,
+                    mode_shapes,
+                    prescribed_dofs,
+                    config["zero_tol"],
+                    excluded_nodes,
+                    prescribed_nodes=prescribed_nodes,
+                )
             if not motion_records:
                 continue
 
             step_block = []
             step_block.extend(build_define_curve_block(config["curve_id"], config["end_time"]))
-            step_block.extend(build_boundary_prescribed_motion_node_block(motion_records, config["curve_id"]))
+            if str(model_info.get("family", "solid")).lower() == "shell":
+                step_block.extend(build_shell_boundary_prescribed_motion_block(motion_records, config["curve_id"]))
+            else:
+                step_block.extend(build_boundary_prescribed_motion_node_block(motion_records, config["curve_id"]))
 
             entry_common = {
                 "name": case_name,
@@ -2678,6 +2852,15 @@ def generate_step_cases_for_bc(case_dir: Path, config: dict) -> List[Path]:
         dual_prescribed_mode_for_case = "prescribed_dofs"
         dual_prescribed_dofs_for_case = [setup_validation["normal_dof"]]
 
+    if dual_prescribed_dofs_for_case is not None:
+        validate_prescribed_motion_writer_availability(
+            case_dir=case_dir,
+            config=config,
+            model_info=model_info,
+            prescribed_dofs=dual_prescribed_dofs_for_case,
+            context="dual STEP",
+        )
+
     for case_name, q_vector in dual_case_defs:
         motion_records = build_dual_motion_records(
             q_vector,
@@ -2687,13 +2870,17 @@ def generate_step_cases_for_bc(case_dir: Path, config: dict) -> List[Path]:
             prescribed_nodes=prescribed_nodes,
             dual_prescribed_mode=dual_prescribed_mode_for_case,
             dual_prescribed_dofs=dual_prescribed_dofs_for_case,
+            allow_shell_rotations=str(model_info.get("family", "solid")).lower() == "shell",
         )
         if not motion_records:
             continue
 
         dual_block = []
         dual_block.extend(build_define_curve_block(config["curve_id"], config["end_time"]))
-        dual_block.extend(build_boundary_prescribed_motion_node_block(motion_records, config["curve_id"]))
+        if str(model_info.get("family", "solid")).lower() == "shell":
+            dual_block.extend(build_shell_boundary_prescribed_motion_block(motion_records, config["curve_id"]))
+        else:
+            dual_block.extend(build_boundary_prescribed_motion_node_block(motion_records, config["curve_id"]))
 
         base_dual = apply_implicit_patch(base_key_lines, config, "nl")
         out_path_dual = step_dir / f"{case_name}{config['dual_output_suffix']}"
