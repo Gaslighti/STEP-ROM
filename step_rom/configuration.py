@@ -29,6 +29,9 @@ class PipelineInput:
     is_parameterized: bool
     parameters: list[UserParameter] = field(default_factory=list)
 
+    def __post_init__(self) -> None:
+        self.project_archive = Path(self.project_archive).expanduser().resolve()
+
     def build_stage_configs(self) -> dict[str, dict[str, Any]]:
         configs = pipeline_defaults()
         configs["export"]["input_archive_name"] = str(self.project_archive)
