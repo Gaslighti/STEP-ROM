@@ -16,6 +16,7 @@ VALID_DOFS = ("UX", "UY", "UZ", "ROTX", "ROTY", "ROTZ")
 TRANSLATIONAL_DOF_MAP = {"UX": 1, "UY": 2, "UZ": 3}
 ROTATIONAL_DOF_MAP = {"ROTX": 4, "ROTY": 5, "ROTZ": 6}
 ROTATIONAL_DOF_IDS = set(ROTATIONAL_DOF_MAP.values())
+TRANSLATIONAL_PRESCRIBED_MOTION_NODE_DOF_IDS = set(TRANSLATIONAL_DOF_MAP.values())
 FILENAME_MODE_RE = re.compile(r"mode[^0-9]*([0-9]+)", re.IGNORECASE)
 
 
@@ -106,16 +107,35 @@ def encode_translational_prescribed_motion_dof(dof: str) -> int:
     return TRANSLATIONAL_DOF_MAP[normalized]
 
 
+def validate_prescribed_motion_records(motion_records, prescribed_dofs, case_name) -> None:
+    """Ensure Node prescribed-motion records contain only translational DOF ids."""
+    for nid, dof_id, _sf_value in motion_records:
+        dof_id_int = int(dof_id)
+        if dof_id_int not in TRANSLATIONAL_PRESCRIBED_MOTION_NODE_DOF_IDS:
+            raise RuntimeError(
+                "Invalid *BOUNDARY_PRESCRIBED_MOTION_NODE record: "
+                f"case={case_name}, node_id={nid}, dof_id={dof_id_int}, "
+                f"prescribed_dofs={prescribed_dofs}. "
+                "Use only translational prescribed motion for Node keyword "
+                "(*BOUNDARY_PRESCRIBED_MOTION_NODE supports dof_id 1/2/3 here)."
+            )
+
+
 def validate_prescribed_motion_node_records(motion_records, *, context: str, vid: int = 0) -> None:
     """Fail before writing an invalid *BOUNDARY_PRESCRIBED_MOTION_NODE block."""
     if vid != 0:
         return
-    bad = [(nid, dof_id) for nid, dof_id, _sf_value in motion_records if int(dof_id) in ROTATIONAL_DOF_IDS]
+    bad = [
+        (nid, dof_id)
+        for nid, dof_id, _sf_value in motion_records
+        if int(dof_id) not in TRANSLATIONAL_PRESCRIBED_MOTION_NODE_DOF_IDS
+    ]
     if bad:
         sample = ", ".join(f"nid={nid}, dof={dof_id}" for nid, dof_id in bad[:5])
         raise ValueError(
             f"{context}: invalid *BOUNDARY_PRESCRIBED_MOTION_NODE records with vid=0 "
-            f"and rotational/vector DOF ids 4/5/6 ({sample}). "
+            f"and non-translational DOF ids outside 1/2/3 ({sample}). "
+            "Use only translational prescribed motion for Node keyword; "
             "ROTX/ROTY/ROTZ нельзя записывать через общий dof_map=4/5/6 без отдельного "
             "корректного LS-DYNA keyword/DOF encoding и/или валидного *DEFINE_VECTOR с ненулевым vid."
         )
@@ -2855,6 +2875,7 @@ def generate_step_cases_for_bc(case_dir: Path, config: dict) -> List[Path]:
             if str(model_info.get("family", "solid")).lower() == "shell":
                 step_block.extend(build_shell_boundary_prescribed_motion_block(motion_records, config["curve_id"]))
             else:
+                validate_prescribed_motion_records(motion_records, prescribed_dofs, case_name)
                 step_block.extend(build_boundary_prescribed_motion_node_block(motion_records, config["curve_id"]))
 
             entry_common = {
@@ -2924,6 +2945,7 @@ def generate_step_cases_for_bc(case_dir: Path, config: dict) -> List[Path]:
         if str(model_info.get("family", "solid")).lower() == "shell":
             dual_block.extend(build_shell_boundary_prescribed_motion_block(motion_records, config["curve_id"]))
         else:
+            validate_prescribed_motion_records(motion_records, dual_prescribed_dofs_for_case, case_name)
             dual_block.extend(build_boundary_prescribed_motion_node_block(motion_records, config["curve_id"]))
 
         base_dual = apply_implicit_patch(base_key_lines, config, "nl")
