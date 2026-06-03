@@ -157,6 +157,14 @@ def normalize_config(config: dict) -> dict:
     cfg["single_q_values"] = normalize_positive_number_or_auto(cfg.get("single_q_values", "auto"), "single_q_values")
     cfg["pair_q_values"] = normalize_positive_number_or_auto(cfg.get("pair_q_values", "auto"), "pair_q_values")
     cfg["triple_q_values"] = normalize_positive_number_or_auto(cfg.get("triple_q_values", "auto"), "triple_q_values")
+    cfg["shell_q_sweep_values"] = ensure_list_of_positive_numbers(
+        list(cfg.get("shell_q_sweep_values", [0.25, 0.5, 1.0])),
+        "shell_q_sweep_values",
+    )
+    cfg["shell_min_q_value"] = float(cfg.get("shell_min_q_value", 1.0e-4))
+    if not math.isfinite(cfg["shell_min_q_value"]) or cfg["shell_min_q_value"] <= 0.0:
+        raise ValueError("shell_min_q_value должен быть конечным числом > 0.")
+    cfg["allow_explicit_shell_single_q_values"] = bool(cfg.get("allow_explicit_shell_single_q_values", False))
     cfg["generate_dual_mode_decks"] = bool(cfg.get("generate_dual_mode_decks", True))
     raw_dual_p = cfg.get("dual_p_value", "auto")
     if raw_dual_p is None or (isinstance(raw_dual_p, str) and raw_dual_p.strip().lower() == "auto"):
@@ -1037,11 +1045,21 @@ def resolve_case_q_settings(case_dir: Path, config: dict, model_info: dict) -> d
     В 3D-prescribed варианте основной путь — очень малые q, масштабированные
     от минимального ребра solid-элемента. FE-калибровка отключена по умолчанию.
     """
+    family = str(model_info.get("family", "solid")).lower()
+
     # Явные q из JSON имеют приоритет над auto-масштабированием.
     if config.get("single_q_values") != "auto":
         single = list(config.get("single_q_values", []))
         if not single:
             raise ValueError("single_q_values задан, но список пуст.")
+        if family == "shell" and not bool(config.get("allow_explicit_shell_single_q_values", False)):
+            shell_min_q = float(config.get("shell_min_q_value", 1.0e-4))
+            if min(float(q) for q in single) < shell_min_q:
+                raise ValueError(
+                    "shell STEP не должен использовать solid-scale q: "
+                    f"min(single_q_values)={min(float(q) for q in single):.6g} < shell_min_q_value={shell_min_q:.6g}. "
+                    "Удалите single_q_values или задайте shell_q_sweep_values."
+                )
         selected_count = len(config.get("selected_modes", []))
         pair = config.get("pair_q_values")
         triple = config.get("triple_q_values")
@@ -1072,7 +1090,7 @@ def resolve_case_q_settings(case_dir: Path, config: dict, model_info: dict) -> d
     ):
         return build_q_settings_from_q_sweep(q_sweep, config, source)
 
-    if str(model_info.get("family", "solid")).lower() == "solid" and bool(config.get("use_per_mode_q_for_solid", False)):
+    if family == "solid" and bool(config.get("use_per_mode_q_for_solid", False)):
         q_by_mode = {str(m): float(q0) for m in config.get("selected_modes", [])}
         return _apply_per_mode_q_settings(
             q_by_mode=q_by_mode,
