@@ -1,13 +1,11 @@
 
 from __future__ import annotations
 
-import argparse
 import csv
 import json
 import logging
 import math
 import re
-import logging
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -74,28 +72,6 @@ def script_dir() -> Path:
         return Path(__file__).resolve().parent
     except NameError:
         return Path.cwd()
-
-
-def deep_update(base: dict, new: dict) -> dict:
-    result = dict(base)
-    for k, v in new.items():
-        if isinstance(v, dict) and isinstance(result.get(k), dict):
-            result[k] = deep_update(result[k], v)
-        else:
-            result[k] = v
-    return result
-
-
-def load_config(config_path: Path) -> dict:
-    if not config_path.exists():
-        raise FileNotFoundError(f"Не найден config: {config_path}")
-
-    cfg = json.loads(config_path.read_text(encoding="utf-8"))
-
-    if not isinstance(cfg, dict):
-        raise ValueError(f"Файл конфигурации должен содержать JSON-объект: {config_path}")
-
-    return cfg
 
 
 def fmt(x: float) -> str:
@@ -1038,19 +1014,9 @@ def evaluate_canonical_gamma(q: np.ndarray, G: np.ndarray, H: np.ndarray) -> np.
 # D3PLOT reading: lasso-python backend
 # ---------------------------------------------------------------------
 def _load_lasso_d3plot_symbols():
-    try:
-        _configure_lasso_logging()
-        from lasso.dyna import D3plot, ArrayType
-        return D3plot, ArrayType
-    except Exception as exc:
-        raise ImportError(
-            "Не удалось импортировать lasso-python из текущего Python-окружения.\n"
-            "Установите пакет lasso-python в то же окружение, которым запускается скрипт,\n"
-            "например:\n"
-            "python -m pip install lasso-python\n"
-            "И проверьте импорт командой:\n"
-            "python -c \"from lasso.dyna import D3plot, ArrayType; print('OK')\""
-        ) from exc
+    _configure_lasso_logging()
+    from lasso.dyna import D3plot, ArrayType
+    return D3plot, ArrayType
 
 
 def _try_lasso_array(arrays, array_type, *names):
@@ -2291,19 +2257,8 @@ def process_bc(case_dir: Path, cfg: dict) -> Dict[str, str]:
     return result
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser(
-        description="Static dual-enhanced canonical STEP postprocessor using STEP reactions + dual d3plot + FE reference d3plot/bndout."
-    )
-    parser.add_argument(
-        "--config",
-        default="4_Generate_ROM.json",
-        help="JSON-конфиг рядом со скриптом."
-    )
-    args = parser.parse_args()
-
-    base_dir = script_dir()
-    cfg = load_config(base_dir / args.config)
+def run_rom_stage(cfg: dict, base_dir: Path | None = None) -> int:
+    base_dir = Path(base_dir) if base_dir is not None else script_dir()
 
     exports_root = Path(cfg["exports_root"])
     if not exports_root.is_absolute():
@@ -2324,7 +2279,3 @@ def main() -> int:
     summary_path.write_text(json.dumps(results, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"[INFO] Summary written: {summary_path}")
     return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())

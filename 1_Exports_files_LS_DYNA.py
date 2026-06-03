@@ -1,16 +1,13 @@
 from __future__ import annotations
 
-import argparse
 import json
 import os
 import shutil
 import subprocess
-import sys
 from pathlib import Path
 from typing import Any
 
 
-DEFAULT_CONFIG_NAME = "1_Exports_files_LS_DYNA.json"
 GENERATED_JOURNAL_NAME = "generated_step_pipeline.wbjn"
 LOG_FILE_NAME = "runwb2_python.log"
 SUCCESS_MARKER_NAME = "workbench_success.txt"
@@ -82,14 +79,6 @@ def remove_path_if_exists(path_obj: Path) -> None:
         shutil.rmtree(path_obj)
     else:
         raise RuntimeError(f"Не удалось удалить путь: {path_obj}")
-
-
-def load_json_config(path_obj: Path) -> dict[str, Any]:
-    with path_obj.open("r", encoding="utf-8") as f:
-        data = json.load(f)
-    if not isinstance(data, dict):
-        raise ValueError(f"JSON config должен содержать объект: {path_obj}")
-    return data
 
 
 def resolve_archive_path(base_dir: Path, requested: object) -> Path:
@@ -423,22 +412,10 @@ def print_summary(parameters: list[dict[str, Any]], base_system_name: str, cases
         )
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser(
-        description="Workbench: Модель + модальный анализ + статика LS-DYNA."
-    )
-    parser.add_argument("--config", default=DEFAULT_CONFIG_NAME)
-    args = parser.parse_args()
-
-    base_dir = Path(__file__).resolve().parent
-    config_file = base_dir / args.config
-    if not config_file.is_file():
-        print(f"[ERROR] Не найден config: {config_file}")
-        return 1
+def run_export_stage(cfg: dict[str, Any], base_dir: Path | None = None) -> int:
+    base_dir = Path(base_dir) if base_dir is not None else Path(__file__).resolve().parent
 
     try:
-        cfg = load_json_config(config_file)
-
         design_point_name = str(cfg.get("design_point_name", "0"))
         default_unit = str(cfg.get("default_unit", "mm"))
         base_system_name = str(cfg.get("base_system_name", "SYS"))
@@ -515,7 +492,6 @@ def main() -> int:
 
         runwb2 = find_runwb2_2024r2()
 
-        print(f"[INFO] Config: {config_file}")
         print(f"[INFO] Generated journal: {generated_journal}")
         print(f"[INFO] Input archive: {input_archive_file}")
         print(f"[INFO] Project file: {project_file}")
@@ -540,7 +516,6 @@ def main() -> int:
         )
 
         manifest = {
-            "config_file": str(config_file),
             "input_archive_file": str(input_archive_file),
             "project_file": str(project_file),
             "updated_archive_file": str(updated_archive_file) if write_updated_archive else None,
@@ -596,8 +571,4 @@ def main() -> int:
             (base_dir / ERROR_MARKER_NAME).write_text(msg + "\n", encoding="utf-8")
         except Exception:
             pass
-        return 1
-
-
-if __name__ == "__main__":
-    sys.exit(main())
+        raise

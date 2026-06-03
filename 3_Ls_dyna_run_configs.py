@@ -50,9 +50,6 @@ def safe_print(*args, sep: str = " ", end: str = "\n", flush: bool = False) -> N
         pass
 
 
-DEFAULT_CONFIG = "3_Ls_dyna_run_configs.json"
-
-
 @dataclass
 class Job:
     bc_name: str
@@ -65,19 +62,6 @@ class Job:
     job_type: str               # "step" | "dual" | "real"
     step_dir: Optional[Path] = None
     run_bat: Optional[Path] = None
-
-
-def load_config(config_path: Path) -> dict:
-    if not config_path.exists():
-        raise FileNotFoundError(f"Не найден config: {config_path}")
-
-    with config_path.open("r", encoding="utf-8") as f:
-        cfg = json.load(f)
-
-    if not isinstance(cfg, dict):
-        raise ValueError(f"Файл конфигурации должен содержать JSON-объект: {config_path}")
-
-    return cfg
 
 
 def windows_quote(arg: str) -> str:
@@ -600,21 +584,8 @@ def write_summary(cfg: dict, base_dir: Path, results: List[dict]) -> None:
     )
 
 
-def main() -> int:
-    import argparse
-
-    parser = argparse.ArgumentParser(
-        description="Сортировка STEP/DUAL/REAL K-файлов по отдельным папкам, запуск LS-DYNA через BAT, экспорт reactions/dual/fe payload."
-    )
-    parser.add_argument(
-        "--config",
-        default="3_Ls_dyna_run_configs.json",
-        help="Имя JSON-конфига рядом со скриптом."
-    )
-    args = parser.parse_args()
-
-    base_dir = Path(__file__).resolve().parent
-    cfg = load_config(base_dir / args.config)
+def run_lsdyna_stage(cfg: dict, base_dir: Path | None = None) -> int:
+    base_dir = Path(base_dir) if base_dir is not None else Path(__file__).resolve().parent
 
     if bool(cfg.get("only_run_existing_jobs", False)):
         jobs = discover_existing_jobs(cfg, base_dir)
@@ -626,7 +597,3 @@ def main() -> int:
     write_summary(cfg, base_dir, results)
     safe_print("[INFO] Done.")
     return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
