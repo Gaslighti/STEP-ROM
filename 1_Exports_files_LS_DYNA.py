@@ -14,6 +14,11 @@ SUCCESS_MARKER_NAME = "workbench_success.txt"
 ERROR_MARKER_NAME = "workbench_error.txt"
 MANIFEST_NAME = "export_manifest.json"
 MODAL_COLLECT_LOG_NAME = "modal_collect_log.txt"
+CONSOLE_MARKER = "[CONSOLE]"
+
+
+def print_console(message: str) -> None:
+    print(f"{CONSOLE_MARKER} {message}")
 
 
 def find_runwb2_2024r2() -> Path:
@@ -497,10 +502,11 @@ def run_export_stage(cfg: dict[str, Any], base_dir: Path | None = None) -> int:
         print(f"[INFO] Project file: {project_file}")
         if write_updated_archive:
             print(f"[INFO] Updated archive: {updated_archive_file}")
+        print_console(f"Workbench output log: {log_file}")
         print_summary(parameters, base_system_name, cases)
 
         return_code = launch_workbench_with_journal_batch(runwb2, generated_journal, base_dir, log_file)
-        print(f"[INFO] Код возврата Workbench: {return_code}")
+        print_console(f"Workbench finished with code {return_code}; full output: {log_file}")
 
         if not success_marker_file.exists():
             error_marker_file.write_text(
@@ -523,6 +529,8 @@ def run_export_stage(cfg: dict[str, Any], base_dir: Path | None = None) -> int:
             "workbench_return_code": return_code,
             "cases": {},
             "modal_outputs": modal_manifest,
+            "modal_collect_log_file": str(modal_collect_log_file),
+            "modal_collect_log_purpose": "Log of copied/missing modal output files only.",
         }
 
         for case in cases:
@@ -545,28 +553,28 @@ def run_export_stage(cfg: dict[str, Any], base_dir: Path | None = None) -> int:
 
         manifest_file.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
 
-        print(f"[INFO] Manifest: {manifest_file}")
-        print(f"[INFO] Modal collect log: {modal_collect_log_file}")
+        print_console(f"Export manifest: {manifest_file}")
+        print(f"[INFO] Modal collect log (modal file collection only): {modal_collect_log_file}")
 
         for case in cases:
             step_key_file = base_dir / case["step_key_output_path"]
             real_key_file = base_dir / case["real_key_output_path"]
 
             if step_key_file.exists():
-                print(f"[INFO] STEP KEY : {step_key_file}")
+                print_console(f"STEP KEY: {step_key_file}")
             else:
-                print(f"[WARNING] STEP KEY не найден: {step_key_file}")
+                print_console(f"[WARNING] STEP KEY не найден: {step_key_file}")
 
             if real_key_file.exists():
-                print(f"[INFO] REAL KEY : {real_key_file}")
+                print_console(f"REAL KEY: {real_key_file}")
             else:
-                print(f"[WARNING] REAL KEY не найден: {real_key_file}")
+                print_console(f"[WARNING] REAL KEY не найден: {real_key_file}")
 
         return return_code
 
     except Exception as exc:
         msg = f"[ERROR] {exc}"
-        print(msg)
+        print_console(msg)
         try:
             (base_dir / ERROR_MARKER_NAME).write_text(msg + "\n", encoding="utf-8")
         except Exception:
