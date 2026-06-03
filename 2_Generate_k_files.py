@@ -799,7 +799,17 @@ def detect_model_info(base_lines: List[str], mode_shapes: Dict[int, ModeShape], 
     flat_ratio = min_span / max(max_span, 1.0e-30) if max_span > 0.0 else 0.0
     normal_axis = min(spans, key=spans.get) if spans else "Z"
 
-    requested = str(config.get("model_family", "auto")).lower()
+    requested = str(config.get("model_family", "auto")).strip().lower()
+    family_source = "runtime_config" if requested != "auto" else "auto_detect"
+    if requested == "solid" and (has_shell or rotations_present or not has_solid):
+        raise ValueError(
+            "model_family='solid' конфликтует с фактическими признаками модели: "
+            f"has_shell_keywords={has_shell}, rotations_present={rotations_present}, "
+            f"has_solid_keywords={has_solid}. "
+            "Shell/rotational model нельзя обрабатывать как solid. "
+            "Используйте model_family='auto' или model_family='shell'."
+        )
+
     if requested != "auto":
         family = requested
     elif has_solid and not has_shell:
@@ -829,7 +839,7 @@ def detect_model_info(base_lines: List[str], mode_shapes: Dict[int, ModeShape], 
         "family": family,
         "resolved_family": family,
         "requested_family": requested,
-        "family_source": "runtime_config" if requested != "auto" else "auto_detect",
+        "family_source": family_source,
         "has_shell_keywords": has_shell,
         "has_solid_keywords": has_solid,
         "rotations_present": rotations_present,
@@ -2486,7 +2496,12 @@ def generate_step_cases_for_bc(case_dir: Path, config: dict) -> List[Path]:
         )
 
     if config["report_excluded_nodes"]:
-        print(f"[INFO] {case_dir.name}: model_family = {model_info['family']}")
+        print(
+            f"[INFO] {case_dir.name}: model_family = {model_info['family']} "
+            f"(requested={model_info.get('requested_family', config.get('model_family', 'auto'))}, "
+            f"resolved={model_info.get('resolved_family', model_info['family'])}, "
+            f"source={model_info.get('family_source', 'unknown')})"
+        )
         print(f"[INFO] {case_dir.name}: geometry_spans = {model_info['geometry_spans']}")
         print(f"[INFO] {case_dir.name}: thickness_estimate = {model_info['thickness_estimate']:.6g}")
         print(f"[INFO] {case_dir.name}: normal_axis = {setup_validation['normal_axis']}")
