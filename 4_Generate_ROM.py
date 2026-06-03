@@ -89,25 +89,70 @@ def _rom_thickness_fallback(cfg: dict) -> float:
     return _coerce_positive_finite_float(cfg.get("thickness_fallback", 1.0), "thickness_fallback")
 
 
+def load_step_manifest(case_dir: Path, cfg: dict) -> dict:
+    manifest_path = (
+        case_dir
+        / str(cfg.get("step_dir_name", "step"))
+        / str(cfg.get("step_manifest_filename", "step_manifest.json"))
+    )
+    cfg["_step_manifest_path"] = str(manifest_path)
+
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        cfg["_step_manifest_warning"] = f"STEP manifest not found: {manifest_path}"
+        return {}
+    except OSError as exc:
+        cfg["_step_manifest_warning"] = f"Unable to read STEP manifest {manifest_path}: {exc}"
+        return {}
+    except json.JSONDecodeError as exc:
+        cfg["_step_manifest_warning"] = f"Unable to parse STEP manifest {manifest_path}: {exc}"
+        return {}
+
+    if not isinstance(manifest, dict):
+        cfg["_step_manifest_warning"] = f"STEP manifest root is not a JSON object: {manifest_path}"
+        return {}
+
+    cfg.pop("_step_manifest_warning", None)
+    cfg["_step_manifest"] = manifest
+    return manifest
+
+
 def resolve_rom_thickness(case_dir: Path, cfg: dict) -> float:
     raw = cfg.get("thickness", "auto")
     if isinstance(raw, Real) and not isinstance(raw, bool):
+        cfg["_rom_thickness_source"] = "config"
         return _coerce_positive_finite_float(raw, "thickness")
 
     if raw is None or str(raw).strip().lower() == "auto":
         fallback = _rom_thickness_fallback(cfg)
-        manifest_path = (
-            case_dir
-            / str(cfg.get("step_dir_name", "step"))
-            / str(cfg.get("step_manifest_filename", "step_manifest.json"))
-        )
-        try:
-            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-            estimate = manifest.get("model_info", {}).get("thickness_estimate")
-            return _coerce_positive_finite_float(estimate, "model_info.thickness_estimate")
-        except (OSError, json.JSONDecodeError, ValueError, TypeError, AttributeError):
-            return fallback
+        model_info = cfg.get("_step_model_info", {})
+        if isinstance(model_info, dict) and "thickness_estimate" in model_info:
+            try:
+                thickness = _coerce_positive_finite_float(
+                    model_info.get("thickness_estimate"),
+                    "model_info.thickness_estimate",
+                )
+            except (ValueError, TypeError) as exc:
+                cfg["_rom_thickness_source"] = "fallback"
+                cfg["_rom_thickness_warning"] = (
+                    "Invalid STEP manifest model_info.thickness_estimate; "
+                    f"using fallback thickness {fallback}: {exc}"
+                )
+                return fallback
+            cfg["_rom_thickness_source"] = "step_manifest"
+            cfg.pop("_rom_thickness_warning", None)
+            return thickness
 
+        cfg["_rom_thickness_source"] = "fallback"
+        manifest_warning = cfg.get("_step_manifest_warning")
+        if manifest_warning:
+            cfg["_rom_thickness_warning"] = f"{manifest_warning}; using fallback thickness {fallback}"
+        else:
+            cfg["_rom_thickness_warning"] = f"STEP manifest model_info.thickness_estimate is missing; using fallback thickness {fallback}"
+        return fallback
+
+    cfg["_rom_thickness_source"] = "config"
     return _coerce_positive_finite_float(raw, "thickness")
 
 
@@ -2063,7 +2108,13 @@ def process_bc(case_dir: Path, cfg: dict) -> Dict[str, str]:
     modes = discover_modes(modal_dir, selected_modes)
 
     local_cfg = dict(cfg)
+    step_manifest = load_step_manifest(case_dir, local_cfg)
+    if isinstance(step_manifest.get("model_info"), dict):
+        local_cfg["_step_model_info"] = step_manifest["model_info"]
     local_cfg["thickness"] = resolve_rom_thickness(case_dir, local_cfg)
+    resolved_model_family = None
+    if isinstance(local_cfg.get("_step_model_info"), dict):
+        resolved_model_family = local_cfg["_step_model_info"].get("family")
     resolved_normal_dof, normal_meta = resolve_normal_dof(local_cfg, modes, selected_modes)
     local_cfg["normal_dof"] = resolved_normal_dof
 
@@ -2169,6 +2220,12 @@ def process_bc(case_dir: Path, cfg: dict) -> Dict[str, str]:
     coeff_json.write_text(
         json.dumps({
             "selected_modes": list(selected_modes),
+            "resolved_model_family": resolved_model_family,
+            "resolved_thickness": float(local_cfg["thickness"]),
+            "thickness_source": local_cfg.get("_rom_thickness_source", "fallback"),
+            "step_manifest_path": local_cfg.get("_step_manifest_path"),
+            "step_manifest_warning": local_cfg.get("_step_manifest_warning"),
+            "thickness_warning": local_cfg.get("_rom_thickness_warning"),
             "normal_dof_requested": cfg.get("normal_dof", "auto"),
             "normal_dof_resolved": resolved_normal_dof,
             "normal_dof_meta": normal_meta,
@@ -2192,6 +2249,14 @@ def process_bc(case_dir: Path, cfg: dict) -> Dict[str, str]:
     lines.append(f"use_rotations_in_generalized_force      = {bool(cfg['use_rotations_in_generalized_force'])}")
     lines.append(f"use_dual_modes                          = {bool(cfg['use_dual_modes'])}")
     lines.append(f"d3plot_backend                          = {cfg['d3plot_backend']}")
+    lines.append(f"step_manifest_path                      = {local_cfg.get('_step_manifest_path')}")
+    lines.append(f"resolved_model_family                   = {resolved_model_family}")
+    lines.append(f"resolved_thickness                      = {float(local_cfg['thickness']):.12e}")
+    lines.append(f"thickness_source                        = {local_cfg.get('_rom_thickness_source', 'fallback')}")
+    if local_cfg.get("_step_manifest_warning"):
+        lines.append(f"WARNING step_manifest                   = {local_cfg['_step_manifest_warning']}")
+    if local_cfg.get("_rom_thickness_warning"):
+        lines.append(f"WARNING thickness                       = {local_cfg['_rom_thickness_warning']}")
     ref_meta = local_cfg.get("_d3plot_reference_meta", {})
     if ref_meta:
         lines.append(f"d3plot_reference_state                 = {ref_meta.get('mode')}")
