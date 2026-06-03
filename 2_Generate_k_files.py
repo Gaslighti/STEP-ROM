@@ -798,6 +798,9 @@ def detect_model_info(base_lines: List[str], mode_shapes: Dict[int, ModeShape], 
 
     return {
         "family": family,
+        "resolved_family": family,
+        "requested_family": requested,
+        "family_source": "runtime_config" if requested != "auto" else "auto_detect",
         "has_shell_keywords": has_shell,
         "has_solid_keywords": has_solid,
         "rotations_present": rotations_present,
@@ -2493,6 +2496,10 @@ def generate_step_cases_for_bc(case_dir: Path, config: dict) -> List[Path]:
             "classic prescribed-motion STEP; q_vector is the commanded displacement vector."
         ),
         "selected_modes": selected_modes,
+        "requested_model_family": model_info.get("requested_family", config.get("model_family", "auto")),
+        "resolved_model_family": model_info.get("family"),
+        "model_family_requested": model_info.get("requested_family", config.get("model_family", "auto")),
+        "model_family_resolved": model_info.get("family"),
         "model_info": model_info,
         "prescribed_dofs": prescribed_dofs,
         "setup_validation": setup_validation,
@@ -2664,6 +2671,10 @@ def generate_step_cases_for_bc(case_dir: Path, config: dict) -> List[Path]:
             "model_info": model_info,
             "prescribed_dofs": prescribed_dofs,
             "setup_validation": setup_validation,
+            "requested_model_family": model_info.get("requested_family", config.get("model_family", "auto")),
+            "resolved_model_family": model_info.get("family"),
+            "model_family_requested": model_info.get("requested_family", config.get("model_family", "auto")),
+            "model_family_resolved": model_info.get("family"),
             "primary_step_prescribed_mode_resolved": config.get("primary_step_prescribed_mode", "auto"),
             "step_load_scheme": step_load_scheme,
             "step_control_basis": "lambda" if step_load_scheme == "surface_nodal_force_step" else "q",
@@ -2709,6 +2720,7 @@ def run_generate_k_files_stage(config: dict, base_dir: Path | None = None) -> No
     print(f"[INFO] cases found  = {len(case_dirs)}")
     print(f"[INFO] mode         = {'lin+nl' if config['generate_linear_and_nonlinear_decks'] else 'single-family'}")
     print(f"[INFO] base key      = {config['base_key_name']}")
+    print(f"[INFO] model family  = {config['model_family']} (requested)")
     print(f"[INFO] patch implicit= {config['patch_implicit_cards']}")
     print(f"[INFO] dual decks    = {config['generate_dual_mode_decks']}")
     if config["generate_dual_mode_decks"]:

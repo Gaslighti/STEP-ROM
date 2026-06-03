@@ -9,6 +9,19 @@ from typing import Any
 from .defaults import pipeline_defaults
 
 
+def _merge_runtime_overrides(target: dict[str, Any], overrides: dict[str, Any]) -> None:
+    """Recursively merge user runtime overrides into stage defaults."""
+
+    for key, value in overrides.items():
+        if (
+            isinstance(value, dict)
+            and isinstance(target.get(key), dict)
+        ):
+            _merge_runtime_overrides(target[key], value)
+        else:
+            target[key] = value
+
+
 @dataclass(slots=True)
 class UserParameter:
     """Workbench parameter value supplied by the user."""
@@ -28,9 +41,12 @@ class PipelineInput:
     project_archive: Path
     is_parameterized: bool
     parameters: list[UserParameter] = field(default_factory=list)
+    runtime_config: dict[str, dict[str, Any]] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         self.project_archive = Path(self.project_archive).expanduser().resolve()
+        if self.runtime_config is None:
+            self.runtime_config = {}
 
     def build_stage_configs(self) -> dict[str, dict[str, Any]]:
         configs = pipeline_defaults()
@@ -40,4 +56,10 @@ class PipelineInput:
             if self.is_parameterized
             else []
         )
+        for stage_name, overrides in self.runtime_config.items():
+            if stage_name not in configs:
+                raise KeyError(f"Unknown STEP-ROM stage config: {stage_name}")
+            if not isinstance(overrides, dict):
+                raise TypeError(f"Runtime overrides for {stage_name} must be a dict")
+            _merge_runtime_overrides(configs[stage_name], overrides)
         return configs
