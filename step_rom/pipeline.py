@@ -10,7 +10,7 @@ from typing import Callable
 
 from .configuration import PipelineInput
 from .legacy_loader import StageModuleLoader
-from .logging_utils import LoggerWriter
+from .logging_utils import LoggerWriter, log_console
 
 
 @dataclass(frozen=True, slots=True)
@@ -63,28 +63,37 @@ class StepRomPipeline:
         self.loader = StageModuleLoader(self.code_root)
 
     def run(self, pipeline_input: PipelineInput) -> None:
-        self.logger.info("STEP-ROM pipeline started")
+        log_console(self.logger, logging.INFO, "STEP-ROM pipeline started")
         self.logger.info("Project archive: %s", pipeline_input.project_archive)
         self.logger.info("Parameterized model: %s", pipeline_input.is_parameterized)
         if pipeline_input.parameters:
             for parameter in pipeline_input.parameters:
-                self.logger.info("Parameter %s = %s [%s]", parameter.name, parameter.value, parameter.unit)
+                self.logger.info(
+                    "Parameter %s = %s [%s]",
+                    parameter.name,
+                    parameter.value,
+                    parameter.unit,
+                )
 
         configs = pipeline_input.build_stage_configs()
         for stage in self.STAGES:
             self._run_stage(stage, configs[stage.config_key])
 
-        self.logger.info("STEP-ROM pipeline finished successfully")
+        log_console(
+            self.logger, logging.INFO, "STEP-ROM pipeline finished successfully"
+        )
 
     def _run_stage(self, stage: StageSpec, config: dict) -> None:
-        self.logger.info("========== START %s ==========", stage.title)
+        log_console(self.logger, logging.INFO, "START %s", stage.title)
         module = self.loader.load(stage.module_name, stage.module_path)
         stage_func: Callable[..., object] = getattr(module, stage.function_name)
 
         stdout_writer = LoggerWriter(self.logger, logging.INFO)
         stderr_writer = LoggerWriter(self.logger, logging.ERROR)
         try:
-            with contextlib.redirect_stdout(stdout_writer), contextlib.redirect_stderr(stderr_writer):
+            with contextlib.redirect_stdout(stdout_writer), contextlib.redirect_stderr(
+                stderr_writer
+            ):
                 result = stage_func(config, base_dir=self.work_dir)
             stdout_writer.flush()
             stderr_writer.flush()
@@ -95,5 +104,8 @@ class StepRomPipeline:
             raise
 
         if isinstance(result, int) and result != 0:
+            log_console(
+                self.logger, logging.ERROR, "FAILED %s (code %s)", stage.title, result
+            )
             raise RuntimeError(f"Этап завершился с кодом {result}: {stage.title}")
-        self.logger.info("========== DONE %s ==========", stage.title)
+        log_console(self.logger, logging.INFO, "DONE %s", stage.title)
